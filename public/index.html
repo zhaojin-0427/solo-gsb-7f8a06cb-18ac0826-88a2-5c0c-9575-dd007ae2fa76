@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cookie 发送决策实验室</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <h1>🍪 Cookie 发送决策实验室</h1>
+      <p class="subtitle">
+        编辑一串按时间推进的步骤：每一步先<strong>判定发送哪些 Cookie</strong>，再<strong>应用响应中的 Set-Cookie</strong>。
+        规则覆盖 Domain / Path / Max-Age / Secure / SameSite，以及同站（schemeful site）判断。
+      </p>
+      <div class="toolbar">
+        <button id="btn-run" class="primary">▶ 运行模拟</button>
+        <div class="dropdown">
+          <button id="btn-example">载入示例 ▾</button>
+          <div class="menu" id="example-menu">
+            <button data-example="full">示例 1：完整流程（写入 / 过期 / 跨站 / 删除）</button>
+            <button data-example="samesite">示例 2：SameSite 三种模式与顶层导航</button>
+            <button data-example="reject">示例 3：Set-Cookie 拦截、有效期与路径边界</button>
+          </div>
+        </div>
+        <button id="btn-add">＋ 新增步骤</button>
+        <button id="btn-clear">清空</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap layout">
+    <section class="panel editor">
+      <h2>步骤编辑</h2>
+      <div id="steps"></div>
+    </section>
+
+    <section class="panel results">
+      <h2>模拟结果时间线</h2>
+      <div id="minimize-panel" class="hidden"></div>
+      <div id="life-panel" class="hidden"></div>
+      <div id="solve-panel" class="hidden"></div>
+      <div id="impact-panel" class="hidden"></div>
+      <div id="results">
+        <p class="placeholder">点击“运行模拟”后，这里会逐步展示：发送的 Cookie、未发送原因、Set-Cookie 写入结果以及当前 Cookie Jar。</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap foot">
+    <span>缺省 Path = <code>/</code>，缺省 SameSite = <code>Lax</code>；同站 = 协议相同且可注册域（eTLD+1）相同。</span>
+  </footer>
+
+  <script src="examples.js"></script>
+  <script src="lifecycle.js"></script>
+  <script src="serverview.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

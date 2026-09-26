@@ -1,0 +1,8 @@
+services:
+  app:
+    build: .
+    image: cookie-decision-lab
+    container_name: cookie-decision-lab
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
