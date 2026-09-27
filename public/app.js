@@ -28,10 +28,15 @@ const STATUS_TEXT = {
 
 let steps = deepClone(window.EXAMPLES.full.steps);
 let lastResults = null; // 最近一次模拟结果，供“最小复现”选取目标
+// 本次模拟起点（epoch 毫秒）：HAR 导入后 = 首条勾选记录的开始时间，
+// 使 Set-Cookie 的 Expires 按抓包绝对时间判定；null = 引擎固定基准
+let simBaseTime = null;
 // “步骤变更影响”对照的冻结基线：一次模拟完成后快照的步骤；编辑器一旦改动即标记失效
 let baselineSteps = null;
+let baselineBaseTime = null; // 冻结基线对应的模拟起点（与 baselineSteps 同时快照）
 let impactReport = null; // 最近一次对照结果
 let impactStep = -1; // 当前对照面板选择的步号（0 基）
+let harState = null; // HAR 导入预览状态（确认或取消前不改动编辑内容）
 function deepClone(obj) {
   return JSON.parse(JSON.stringify(obj));
 }
@@ -75,8 +80,8 @@ function renderStepCard(s, i) {
   card.appendChild(head);
 
   const r1 = el('div', 'row2');
-  r1.appendChild(field('经过秒数',
-    `<input type="number" min="0" step="1" data-k="seconds" value="${esc(s.seconds)}">`));
+  r1.appendChild(field('经过秒数（可精确到毫秒）',
+    `<input type="number" min="0" step="0.001" data-k="seconds" value="${esc(s.seconds)}">`));
   r1.appendChild(field('请求 URL（http / https）',
     `<input type="text" data-k="url" value="${esc(s.url)}" placeholder="https://example.com/path">`));
   card.appendChild(r1);
@@ -150,8 +155,11 @@ document.getElementById('btn-add').addEventListener('click', () => {
 
 document.getElementById('btn-clear').addEventListener('click', () => {
   steps = [];
+  simBaseTime = null; // 清空：模拟起点回到引擎固定基准
+  renderBaseTimeHint();
   renderSteps();
   baselineSteps = null; // 清空：基线不存在，旧对照一并失效
+  baselineBaseTime = null;
   impactReport = null;
   impactStep = -1;
   hideImpactPanel();
@@ -170,6 +178,8 @@ menu.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-example]');
   if (!btn) return;
   steps = deepClone(window.EXAMPLES[btn.dataset.example].steps);
+  simBaseTime = null; // 示例使用引擎固定基准起点
+  renderBaseTimeHint();
   renderSteps();
   menu.classList.remove('open');
   await runSimulation();
@@ -190,7 +200,7 @@ async function runSimulation() {
     const resp = await fetch('/api/simulate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steps })
+      body: JSON.stringify({ steps, baseTime: simBaseTime })
     });
     data = await resp.json();
     if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
@@ -204,12 +214,14 @@ async function runSimulation() {
   if (!data.results.length) {
     lastResults = null;
     baselineSteps = null; // 没有步骤：基线与对照一并清空
+    baselineBaseTime = null;
     out.appendChild(el('p', 'placeholder', '没有步骤。'));
     return;
   }
   lastResults = data.results;
-  // 一次模拟完成后冻结步骤与结果作为“步骤变更影响”对照的基线
+  // 一次模拟完成后冻结步骤与结果作为“步骤变更影响”对照的基线（含模拟起点）
   baselineSteps = deepClone(steps);
+  baselineBaseTime = simBaseTime;
   // 服务端同名取值 · 分歧时间线汇总（沿有效请求；每次运行随结果整体刷新，不改编辑内容）
   out.appendChild(renderServerViewSummary(data.results));
   data.results.forEach((r, i) => out.appendChild(renderResult(r, i)));
@@ -812,7 +824,7 @@ async function minimizeToTarget(stepIndex, kind, idx) {
     const resp = await fetch('/api/minimize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steps, target })
+      body: JSON.stringify({ steps, target, baseTime: simBaseTime })
     });
     data = await resp.json();
     if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
@@ -1005,7 +1017,7 @@ async function runSolve(box, target) {
     const resp = await fetch('/api/solve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steps, target })
+      body: JSON.stringify({ steps, target, baseTime: simBaseTime })
     });
     data = await resp.json();
     if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
@@ -1294,7 +1306,8 @@ async function runImpactCompare(box, change) {
     const resp = await fetch('/api/impact', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steps: baselineSteps, change })
+      // 对照全程使用冻结基线（步骤与模拟起点），不读取当前编辑器状态
+      body: JSON.stringify({ steps: baselineSteps, change, baseTime: baselineBaseTime })
     });
     data = await resp.json();
     if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
@@ -1489,6 +1502,298 @@ function renderImpactReport(box, data) {
   });
 }
 
+// ---------- HAR 导入（本地解析，不上传） ----------
+
+function harPanel() {
+  return document.getElementById('har-panel');
+}
+
+/** 模拟起点提示：仅 HAR 导入后显示（缺省为引擎固定基准，不显示）。 */
+function renderBaseTimeHint() {
+  const node = document.getElementById('base-time-hint');
+  if (simBaseTime == null) {
+    node.className = 'hidden';
+    node.innerHTML = '';
+    return;
+  }
+  node.className = 'base-time-hint';
+  node.textContent = '⏱ 模拟起点（HAR 首条记录）：' + new Date(simBaseTime).toISOString() +
+    '。Set-Cookie 的 Expires 按该抓包绝对时间判定；最小复现、策略求解与步骤变更影响沿用同一起点。';
+}
+
+/** 关闭预览 / 取消导入：不改动任何编辑内容。 */
+function closeHarPanel() {
+  harState = null;
+  const panel = harPanel();
+  panel.className = 'hidden';
+  panel.innerHTML = '';
+}
+
+/** 文件无效等情况：只提示，不改动当前编辑内容。 */
+function showHarError(fileName, message) {
+  harState = null;
+  const panel = harPanel();
+  panel.innerHTML = '';
+  panel.className = 'har-panel';
+
+  const head = el('div', 'life-head');
+  head.appendChild(el('div', 'section-title', '📥 HAR 导入（' + esc(fileName) + '）'));
+  const close = el('button', 'panel-close', '关闭');
+  close.type = 'button';
+  close.addEventListener('click', closeHarPanel);
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  panel.appendChild(el('div', 'error-box', '无法导入：' + esc(message) + '（当前编辑内容未改动）'));
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function harSkipSummary(skipped) {
+  const counts = new Map();
+  skipped.forEach((s) => counts.set(s.reason, (counts.get(s.reason) || 0) + 1));
+  return [...counts.entries()].map(([reason, n]) => reason + ' × ' + n).join('；');
+}
+
+const harFileInput = document.getElementById('har-file');
+document.getElementById('btn-har').addEventListener('click', () => harFileInput.click());
+harFileInput.addEventListener('change', () => {
+  const file = harFileInput.files && harFileInput.files[0];
+  harFileInput.value = ''; // 允许再次选择同一文件
+  if (!file) return; // 取消选择：不改动任何内容
+  const reader = new FileReader();
+  reader.onload = () => openHarPreview(file.name, String(reader.result == null ? '' : reader.result));
+  reader.onerror = () => showHarError(file.name, '文件读取失败');
+  reader.readAsText(file);
+});
+
+function openHarPreview(fileName, text) {
+  const res = window.HarImport.parseHar(text);
+  if (!res.ok) {
+    showHarError(fileName, res.error);
+    return;
+  }
+  if (!res.entries.length) {
+    showHarError(fileName, '没有可导入的 HTTP(S) 请求' +
+      (res.skipped.length ? '（跳过 ' + res.skipped.length + ' 条：' + harSkipSummary(res.skipped) + '）' : ''));
+    return;
+  }
+  harState = {
+    fileName,
+    entries: window.HarImport.sortByStart(res.entries), // 按开始时间升序，同刻保留原行序
+    skipped: res.skipped,
+    limitWarned: false
+  };
+  harState.entries.forEach((entry, i) => {
+    entry.checked = i < window.HarImport.MAX_IMPORT; // 默认勾选前 100 条
+    entry.topUrl = ''; // 顶层页面 URL 不从 HAR 推断，逐条确认（留空 = 一方请求）
+    entry.isNavigation = false; // 导航标记同样不从 HAR 推断
+  });
+  renderHarPanel();
+  harPanel().scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderHarPanel() {
+  const st = harState;
+  const panel = harPanel();
+  panel.innerHTML = '';
+  panel.className = 'har-panel';
+
+  const head = el('div', 'life-head');
+  head.appendChild(el('div', 'section-title', '📥 HAR 导入预览（' + esc(st.fileName) + '）'));
+  const close = el('button', 'panel-close', '取消');
+  close.type = 'button';
+  close.title = '取消导入，不改动当前编辑内容';
+  close.addEventListener('click', closeHarPanel);
+  head.appendChild(close);
+  panel.appendChild(head);
+
+  const total = st.entries.length + st.skipped.length;
+  panel.appendChild(el('p', 'har-stats',
+    '共 ' + total + ' 条记录：可导入 ' + st.entries.length + ' 条' +
+    (st.skipped.length ? '，跳过 ' + st.skipped.length + ' 条（' + esc(harSkipSummary(st.skipped)) + '）' : '') +
+    '。已按开始时间升序排列（同刻保留原行序），勾选至多 ' + window.HarImport.MAX_IMPORT + ' 条。'));
+  panel.appendChild(el('p', 'har-stats',
+    '逐条确认顶层页面 URL（留空 = 一方请求）与顶层导航标记——HAR 不含这些信息，不从抓包推断。' +
+    '经过秒数由相邻勾选记录的开始时间差生成（精确到毫秒），首条为 0；' +
+    '确认后以首条记录时间为本次模拟起点，Expires 按抓包绝对时间判定。'));
+
+  if (st.skipped.length) {
+    const box = el('div', 'har-skipped');
+    box.appendChild(el('div', 'section-title', '被跳过的记录（不参与导入）'));
+    const list = el('ul', 'har-skip-list');
+    st.skipped.slice(0, 8).forEach((s) => {
+      list.appendChild(el('li', '', 'HAR 第 ' + (s.index + 1) + ' 条：' + esc(s.reason)));
+    });
+    if (st.skipped.length > 8) {
+      list.appendChild(el('li', '', '……其余 ' + (st.skipped.length - 8) + ' 条从略'));
+    }
+    box.appendChild(list);
+    panel.appendChild(box);
+  }
+
+  const wrap = el('div', 'har-table-wrap');
+  const table = el('table', 'cookies har-table');
+  table.innerHTML = '<thead><tr>' +
+    ['导入', '#', '方法 / URL', '开始时间 / 耗时', '经过秒数', 'Set-Cookie',
+      '顶层页面 URL（留空 = 一方）', '顶层导航']
+      .map((h) => '<th>' + esc(h) + '</th>').join('') +
+    '</tr></thead>';
+  const tb = el('tbody');
+  st.entries.forEach((entry, row) => {
+    const tr = el('tr', 'har-row');
+    tr.dataset.id = entry.id;
+
+    const tdCheck = el('td', 'har-check-cell');
+    const check = document.createElement('input');
+    check.type = 'checkbox';
+    check.className = 'har-check';
+    check.checked = entry.checked;
+    check.addEventListener('change', () => {
+      if (check.checked && st.entries.filter((x) => x.checked).length >= window.HarImport.MAX_IMPORT) {
+        check.checked = false; // 已达上限：本次勾选不生效
+        st.limitWarned = true;
+      } else {
+        entry.checked = check.checked;
+      }
+      refreshHarTimeline();
+    });
+    tdCheck.appendChild(check);
+    tr.appendChild(tdCheck);
+
+    tr.appendChild(el('td', '', String(row + 1) +
+      '<div class="har-sub">HAR #' + (entry.id + 1) + '</div>'));
+
+    const tdUrl = el('td');
+    tdUrl.innerHTML = '<span class="badge attr">' + esc(entry.method) + '</span> ' +
+      '<span class="mono har-url" title="' + esc(entry.url) + '">' + esc(entry.url) + '</span>';
+    tr.appendChild(tdUrl);
+
+    tr.appendChild(el('td', '', '<span class="mono">' + esc(new Date(entry.startMs).toISOString()) + '</span>' +
+      '<div class="har-sub">耗时 ' + esc(entry.timeMs) + ' ms</div>'));
+
+    tr.appendChild(el('td', 'har-seconds', '—'));
+
+    tr.appendChild(el('td', '', entry.setCookies.length
+      ? '<span class="badge stored">' + entry.setCookies.length + ' 条</span>'
+      : '<span class="har-sub">无</span>'));
+
+    const tdTop = el('td');
+    const topInput = document.createElement('input');
+    topInput.type = 'text';
+    topInput.className = 'har-top';
+    topInput.placeholder = '留空 = 一方请求';
+    topInput.value = entry.topUrl;
+    topInput.addEventListener('input', () => { entry.topUrl = topInput.value; });
+    tdTop.appendChild(topInput);
+    tr.appendChild(tdTop);
+
+    const tdNav = el('td', 'har-check-cell');
+    const nav = document.createElement('input');
+    nav.type = 'checkbox';
+    nav.className = 'har-nav';
+    nav.checked = entry.isNavigation;
+    nav.addEventListener('change', () => { entry.isNavigation = nav.checked; });
+    tdNav.appendChild(nav);
+    tr.appendChild(tdNav);
+
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  wrap.appendChild(table);
+  panel.appendChild(wrap);
+
+  const hint = el('p', 'har-stats har-hint', '');
+  panel.appendChild(hint);
+
+  const warn = el('div', 'har-overlap-warn hidden');
+  panel.appendChild(warn);
+
+  const actions = el('div', 'minimize-actions');
+  const confirm = el('button', 'primary', '✔ 确认导入（替换当前步骤）');
+  confirm.type = 'button';
+  confirm.addEventListener('click', confirmHarImport);
+  actions.appendChild(confirm);
+  const cancel = el('button', '', '取消');
+  cancel.type = 'button';
+  cancel.addEventListener('click', closeHarPanel);
+  actions.appendChild(cancel);
+  panel.appendChild(actions);
+
+  st.els = { hint, warn, confirm };
+  refreshHarTimeline();
+}
+
+/** 勾选变化后重算经过秒数与重叠：重叠的两行标出并阻止载入。 */
+function refreshHarTimeline() {
+  const st = harState;
+  if (!st || !st.els) return;
+  const panel = harPanel();
+  const selected = st.entries.filter((e) => e.checked);
+  const tl = window.HarImport.computeTimeline(selected);
+
+  const secById = new Map();
+  selected.forEach((e, i) => secById.set(e.id, tl.seconds[i]));
+  st.entries.forEach((e) => {
+    const tr = panel.querySelector('tr.har-row[data-id="' + e.id + '"]');
+    if (!tr) return;
+    tr.classList.remove('har-overlap');
+    const cell = tr.querySelector('.har-seconds');
+    cell.textContent = secById.has(e.id) ? '+' + secById.get(e.id) + 's' : '—';
+  });
+
+  if (tl.overlaps.length) {
+    const lines = tl.overlaps.map((o) => {
+      const a = selected[o.first];
+      const b = selected[o.second];
+      [a, b].forEach((e) => {
+        const tr = panel.querySelector('tr.har-row[data-id="' + e.id + '"]');
+        if (tr) tr.classList.add('har-overlap'); // 标出两行
+      });
+      return '第 ' + (st.entries.indexOf(a) + 1) + ' 行响应结束（' + new Date(a.endMs).toISOString() +
+        '）晚于第 ' + (st.entries.indexOf(b) + 1) + ' 行请求开始（' + new Date(b.startMs).toISOString() + '）';
+    });
+    st.els.warn.className = 'har-overlap-warn';
+    st.els.warn.innerHTML = '⚠ 请求 / 响应时间重叠，无法载入：<br>' + lines.map(esc).join('<br>') +
+      '<br>请调整勾选（去掉重叠一侧的记录）后再导入。当前编辑内容未改动。';
+  } else {
+    st.els.warn.className = 'hidden';
+    st.els.warn.innerHTML = '';
+  }
+
+  st.els.confirm.disabled = !selected.length || tl.overlaps.length > 0;
+  let hintText = '已勾选 ' + selected.length + ' / ' + window.HarImport.MAX_IMPORT + ' 条。';
+  if (st.limitWarned) {
+    hintText = '至多勾选 ' + window.HarImport.MAX_IMPORT + ' 条（已达上限，本次勾选未生效）。' + hintText;
+    st.limitWarned = false;
+  }
+  st.els.hint.textContent = hintText;
+}
+
+/** 确认导入：替换编辑步骤，以首条记录时间为本次模拟起点并重跑。 */
+function confirmHarImport() {
+  const st = harState;
+  if (!st) return;
+  const selected = st.entries.filter((e) => e.checked);
+  if (!selected.length) return;
+  const tl = window.HarImport.computeTimeline(selected);
+  if (tl.overlaps.length) return; // 双保险：重叠时阻止载入
+
+  steps = selected.map((e, i) => ({
+    seconds: tl.seconds[i],
+    url: e.url,
+    method: e.method,
+    topUrl: (e.topUrl || '').trim(),
+    isNavigation: e.isNavigation === true,
+    setCookies: e.setCookies.slice()
+  }));
+  simBaseTime = selected[0].startMs; // 首条记录时间 = 本次模拟起点
+  closeHarPanel();
+  renderBaseTimeHint();
+  renderSteps();
+  runSimulation();
+}
+
 // 启动时自动载入并运行示例 1
+renderBaseTimeHint();
 renderSteps();
 runSimulation();

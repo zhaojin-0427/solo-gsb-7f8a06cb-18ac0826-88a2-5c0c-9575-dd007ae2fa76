@@ -1012,4 +1012,233 @@ assert.strictEqual(direct.length, 0, '同一次结果自比无差异（含原因
 assert.strictEqual(impVal.modifiedStep.seconds, impactSteps[0].seconds, '秒数保持不变');
 assert.strictEqual(impVal.baselineStep.url, impactSteps[0].url, '基线对象保留原 URL');
 
+// ---------- HAR 导入（public/har.js）----------
+const HarImport = require('../public/har');
+const { BASE_TIME } = require('../lib/simulate');
+
+function harEntry(over) {
+  return {
+    startedDateTime: '2026-03-01T10:00:00.000Z',
+    time: 100,
+    request: { method: 'GET', url: 'https://x.example/' },
+    response: { headers: [] },
+    ...over
+  };
+}
+
+// 无效文件：非 JSON / 缺 log.entries
+ok(HarImport.parseHar('not json').ok === false, '非 JSON 拒绝');
+ok(HarImport.parseHar('{}').ok === false, '缺 log 拒绝');
+ok(HarImport.parseHar(JSON.stringify({ log: {} })).ok === false, '缺 log.entries 拒绝');
+ok(HarImport.parseHar(JSON.stringify({ log: { entries: 'x' } })).ok === false, 'entries 非数组拒绝');
+
+// 条目过滤：仅接受编辑器支持的方法、带时区的有效 startedDateTime、非负有限 time
+const mixed = HarImport.parseHar(JSON.stringify({ log: { entries: [
+  harEntry({}), // OK
+  harEntry({ request: { method: 'GET', url: 'ws://x.example/' } }), // 非 http(s)
+  harEntry({ request: { method: 'GET', url: 'not a url' } }), // 无法解析
+  harEntry({ request: { method: 'CONNECT', url: 'https://x.example/' } }), // 方法不支持
+  harEntry({ startedDateTime: '2026-03-01T10:00:00.000' }), // 不带时区
+  harEntry({ startedDateTime: '2026-03-01 10:00:00' }), // 非 ISO 且无偏移
+  harEntry({ startedDateTime: 'not-a-date' }), // 无效时间
+  (() => { const e = harEntry({}); delete e.startedDateTime; return e; })(), // 缺 startedDateTime
+  harEntry({ startedDateTime: '2026-03-01T10:00:00.000Z', time: -1 }), // time 为负
+  harEntry({ startedDateTime: '2026-03-01T10:00:00.000Z', time: 'abc' }), // time 非数值
+  (() => { const e = harEntry({}); delete e.time; return e; })(), // 缺 time
+  harEntry({ startedDateTime: '2026-03-01T10:00:00.500+08:00',
+    request: { method: 'POST', url: 'http://x.example/api' } }) // OK（带偏移时区 + http + POST）
+] } }));
+ok(mixed.ok === true, '混合 HAR 可解析');
+assert.strictEqual(mixed.entries.length, 2, '仅 2 条满足全部接受条件');
+assert.strictEqual(mixed.skipped.length, 10, '其余 10 条各带原因跳过');
+assert.strictEqual(mixed.entries[1].method, 'POST');
+assert.strictEqual(mixed.entries[1].startMs, Date.parse('2026-03-01T10:00:00.500+08:00'));
+assert.strictEqual(mixed.entries[1].startMs, Date.parse('2026-03-01T02:00:00.500Z'),
+  '偏移时区换算为绝对时刻');
+ok(mixed.skipped.every((s) => typeof s.reason === 'string' && s.reason.length > 0), '跳过均带原因');
+ok(mixed.skipped.some((s) => /时区/.test(s.reason)), '不带时区被单独标出');
+ok(mixed.skipped.some((s) => /方法/.test(s.reason)), '方法不支持被标出');
+assert.strictEqual(HarImport.MAX_IMPORT, 100, '导入上限 100 条');
+
+// Set-Cookie 提取：按 response.headers 原顺序取全部同名头（不区分大小写），不按逗号拆分
+const scLines = HarImport.extractSetCookies({ headers: [
+  { name: 'Content-Type', value: 'text/html' },
+  { name: 'Set-Cookie', value: 'a=1; Path=/; Expires=Wed, 01 Apr 2026 00:00:00 GMT' },
+  { name: 'set-cookie', value: 'b=2; Path=/' },
+  { name: 'SET-COOKIE', value: 'c=3' },
+  { name: 'set-cookie2', value: 'nope=1' },
+  { name: 'X-Other', value: 'set-cookie: x=1' }
+] });
+assert.deepStrictEqual(scLines,
+  ['a=1; Path=/; Expires=Wed, 01 Apr 2026 00:00:00 GMT', 'b=2; Path=/', 'c=3'],
+  '原顺序取全部 Set-Cookie，头名不区分大小写');
+ok(scLines[0].includes(','), 'Expires 中的逗号保留，不按逗号拆分');
+assert.deepStrictEqual(HarImport.extractSetCookies({}), [], '缺 headers 时为空');
+assert.deepStrictEqual(HarImport.extractSetCookies(null), []);
+
+// 排序：按开始时间升序，同刻保留原行序（time 取 0，避免同刻记录因耗时重叠）
+const sameStart = HarImport.parseHar(JSON.stringify({ log: { entries: [
+  harEntry({ startedDateTime: '2026-03-01T10:00:01.000Z', time: 0, request: { method: 'GET', url: 'https://x.example/b' } }),
+  harEntry({ startedDateTime: '2026-03-01T10:00:00.000Z', time: 0, request: { method: 'GET', url: 'https://x.example/a' } }),
+  harEntry({ startedDateTime: '2026-03-01T10:00:01.000Z', time: 0, request: { method: 'GET', url: 'https://x.example/c' } })
+] } }));
+const sortedSame = HarImport.sortByStart(sameStart.entries);
+assert.deepStrictEqual(sortedSame.map((e) => e.url),
+  ['https://x.example/a', 'https://x.example/b', 'https://x.example/c'],
+  '升序且同刻保留原行序');
+assert.deepStrictEqual(sortedSame.map((e) => e.id), [1, 0, 2], '原 HAR 行序按下标保留');
+
+// 时间线：相邻时间差生成秒数（精确到毫秒），首步为 0；重叠标出两行
+const tlOk = HarImport.computeTimeline(sortedSame);
+assert.deepStrictEqual(tlOk.seconds, [0, 1, 0], '相邻开始时间差生成秒数');
+assert.deepStrictEqual(tlOk.overlaps, [], '无重叠');
+
+const overlapSeq = [
+  { id: 0, startMs: 10000, timeMs: 2000, endMs: 12000 }, // 结束 12s
+  { id: 1, startMs: 11500, timeMs: 100, endMs: 11600 },  // 开始 11.5s < 12s → 重叠
+  { id: 2, startMs: 13000, timeMs: 0, endMs: 13000 }
+];
+const tlOv = HarImport.computeTimeline(overlapSeq);
+assert.deepStrictEqual(tlOv.seconds, [0, 1.5, 1.5], '秒数精确到毫秒');
+assert.deepStrictEqual(tlOv.overlaps, [{ first: 0, second: 1 }], '重叠标出相邻两行');
+// 边界：前一响应结束 == 下一请求开始，不算重叠（须“晚于”）
+const touchSeq = [
+  { id: 0, startMs: 10000, timeMs: 2000, endMs: 12000 },
+  { id: 1, startMs: 12000, timeMs: 0, endMs: 12000 }
+];
+assert.deepStrictEqual(HarImport.computeTimeline(touchSeq).overlaps, [], '首尾相接不算重叠');
+
+// ---------- 模拟起点（baseTime）：Expires 按抓包绝对时间判定 ----------
+const T0 = Date.parse('2026-03-01T00:00:00.000Z');
+
+// 起点与毫秒精度
+const simT0 = runSimulation([
+  { seconds: 0, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 1.5, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+], { baseTime: T0 }).results;
+assert.strictEqual(simT0[0].clock, T0, '首步时钟 = 模拟起点');
+assert.strictEqual(simT0[0].clockISO, '2026-03-01T00:00:00.000Z');
+assert.strictEqual(simT0[1].clock, T0 + 1500, '小数秒精确到毫秒');
+assert.strictEqual(simT0[1].clockISO, '2026-03-01T00:00:01.500Z');
+// 缺省回归：不传 baseTime 仍用固定基准
+const simDef = runSimulation([
+  { seconds: 0, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+]).results;
+assert.strictEqual(simDef[0].clock, BASE_TIME, '缺省起点保持固定基准');
+
+// Expires 绝对时间：T0+60s 过期，59s 时发送、61s 时过期淘汰
+const simAbs = runSimulation([
+  { seconds: 0, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['e=1; Path=/; Expires=Sun, 01 Mar 2026 00:01:00 GMT'] },
+  { seconds: 59, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 2, url: 'https://x.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+], { baseTime: T0 }).results;
+ok(simAbs[1].sent.some((c) => c.name === 'e'), 'T0+59s：未过期，发送');
+const eUnsent = simAbs[2].unsent.find((u) => u.cookie.name === 'e');
+ok(eUnsent && eUnsent.reasons.includes('EXPIRED'), 'T0+61s：按抓包绝对时间过期');
+ok(!simAbs[2].jarAfter.some((c) => c.name === 'e'), '过期后从 Jar 淘汰');
+
+// HAR 端到端：解析 → 排序 → 秒数 → 以首条记录时间为起点模拟
+const harDoc = { log: { entries: [
+  { startedDateTime: '2026-03-01T10:00:00.000Z', time: 120,
+    request: { method: 'GET', url: 'https://shop.example.com/' },
+    response: { headers: [
+      { name: 'Content-Type', value: 'text/html' },
+      { name: 'Set-Cookie', value: 'sid=a1; Path=/; Expires=Sun, 01 Mar 2026 10:01:00 GMT' },
+      { name: 'set-cookie', value: 'cart=2; Path=/cart' }
+    ] } },
+  { startedDateTime: '2026-03-01T10:00:30.500Z', time: 80,
+    request: { method: 'GET', url: 'https://shop.example.com/cart' },
+    response: { headers: [] } },
+  { startedDateTime: '2026-03-01T10:01:30.000Z', time: 50,
+    request: { method: 'GET', url: 'https://shop.example.com/cart' },
+    response: { headers: [] } }
+] } };
+const harParsed = HarImport.parseHar(JSON.stringify(harDoc));
+ok(harParsed.ok && harParsed.entries.length === 3 && harParsed.skipped.length === 0);
+const harSorted = HarImport.sortByStart(harParsed.entries);
+const harTl = HarImport.computeTimeline(harSorted);
+assert.deepStrictEqual(harTl.seconds, [0, 30.5, 59.5], '相邻时间差生成秒数（毫秒精度）');
+assert.deepStrictEqual(harTl.overlaps, []);
+assert.deepStrictEqual(harSorted[0].setCookies,
+  ['sid=a1; Path=/; Expires=Sun, 01 Mar 2026 10:01:00 GMT', 'cart=2; Path=/cart'],
+  'Set-Cookie 按头原顺序全部保留');
+const harSteps = harSorted.map((e, i) => ({
+  seconds: harTl.seconds[i], url: e.url, method: e.method,
+  topUrl: '', isNavigation: false, setCookies: e.setCookies
+}));
+const harSim = runSimulation(harSteps, { baseTime: harSorted[0].startMs }).results;
+assert.strictEqual(harSim[0].clock, Date.parse('2026-03-01T10:00:00.000Z'), '首条记录时间 = 模拟起点');
+assert.strictEqual(harSim[1].clock, Date.parse('2026-03-01T10:00:30.500Z'), '毫秒级时钟推进');
+assert.deepStrictEqual(harSim[1].sent.map((c) => c.name), ['cart', 'sid'],
+  '10:00:30.500 两条 Cookie 均发送（路径更长者优先）');
+assert.deepStrictEqual(harSim[2].sent.map((c) => c.name), ['cart'],
+  '10:01:30 sid 已按抓包绝对时间过期，会话期 cart 仍发送');
+ok(harSim[2].unsent.find((u) => u.cookie.name === 'sid').reasons.includes('EXPIRED'));
+
+// 最小复现沿用该起点：过期目标只有在 baseTime 下才能定位
+const stepsExpMin = [
+  { seconds: 0, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['tmp=1; Path=/; Expires=Sun, 01 Mar 2026 00:01:40 GMT'] }, // T0+100s 过期
+  { seconds: 50, url: 'https://pad.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] },
+  { seconds: 60, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+];
+const resExpMin = runSimulation(stepsExpMin, { baseTime: T0 }).results;
+const tmpU = resExpMin[2].unsent.find((u) => u.cookie.name === 'tmp');
+ok(tmpU && tmpU.reasons.includes('EXPIRED'), 'T0+110s 时 tmp 已过期');
+const minExp = minimizeSteps(stepsExpMin,
+  { stepIndex: 2, name: 'tmp', value: '1', domain: tmpU.cookie.domain, path: '/',
+    sent: false, reasons: tmpU.reasons.slice() },
+  { baseTime: T0 });
+ok(minExp.ok === true, '带模拟起点的最小复现可定位过期目标');
+assert.strictEqual(minExp.after.steps, 2, '无关整步被删');
+assert.strictEqual(minExp.steps[1].seconds, 110, '被删步的 50s 并入目标步');
+const minExpRes = runSimulation(minExp.steps, { baseTime: T0 }).results;
+assert.strictEqual(minExpRes[minExpRes.length - 1].clock, T0 + 110000, '保留请求的绝对时刻沿用同一起点');
+ok(targetMatches(minExpRes[minExpRes.length - 1],
+  { name: 'tmp', value: '1', domain: tmpU.cookie.domain, path: '/', sent: false, reasons: tmpU.reasons }),
+  '最小化后末步仍复现过期未发送目标');
+const minNoBase = minimizeSteps(stepsExpMin,
+  { stepIndex: 2, name: 'tmp', value: '1', domain: tmpU.cookie.domain, path: '/',
+    sent: false, reasons: tmpU.reasons.slice() });
+ok(minNoBase.ok === false, '缺少起点时同一目标无法定位（默认基准下未过期）');
+
+// 策略求解沿用该起点：过期使“不应发送”在候选空间内可达
+const solBaseSteps = [
+  { seconds: 0, url: 'https://s.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['k=1; Path=/; Expires=Sun, 01 Mar 2026 00:00:10 GMT'] }, // T0+10s 过期
+  { seconds: 20, url: 'https://s.example/x', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+];
+const solBase = solveStrategy(solBaseSteps, {
+  stepIndex: 0, respIndex: 0, raw: 'k=1; Path=/; Expires=Sun, 01 Mar 2026 00:00:10 GMT',
+  marks: [{ stepIndex: 1, sent: false }]
+}, { baseTime: T0 });
+ok(solBase.ok === true, '带模拟起点：T0+20s 已过期，任何候选都满足不应发送');
+ok(solBase.checks[0].actual === false && solBase.checks[0].reasons.includes('EXPIRED'));
+const solNoBase = solveStrategy(solBaseSteps, {
+  stepIndex: 0, respIndex: 0, raw: 'k=1; Path=/; Expires=Sun, 01 Mar 2026 00:00:10 GMT',
+  marks: [{ stepIndex: 1, sent: false }]
+});
+ok(solNoBase.ok === false && solNoBase.invalid !== true,
+  '默认起点下 Cookie 存活且同站必发送，同一标记无解');
+
+// 步骤变更影响沿用该起点：基线 / 副本两侧按同一抓包起点对照
+const impBase = compareSteps(stepsExpMin, {
+  stepIndex: 0,
+  setCookies: ['tmp=1; Path=/; Expires=Sun, 01 Mar 2026 00:03:00 GMT'] // 延长到 T0+180s
+}, { baseTime: T0 });
+ok(impBase.ok && !impBase.identical, '带起点：延长 Expires 改变后续过期判定');
+const impStep2 = impBase.stepDiffs.find((d) => d.step === 2);
+const impSendDiff = impStep2 && impStep2.diffs.find((d) => d.phase === 'send' && d.kind === 'sent');
+ok(impSendDiff && impSendDiff.baseline === null && impSendDiff.copy && impSendDiff.copy.name === 'tmp',
+  '第 3 步：基线已过期未发送，副本存活发送');
+const impNoBase = compareSteps(stepsExpMin, {
+  stepIndex: 0,
+  setCookies: ['tmp=1; Path=/; Expires=Sun, 01 Mar 2026 00:03:00 GMT']
+});
+ok(impNoBase.ok && !impNoBase.identical, '默认起点下两侧 Expires 属性仍不同');
+const impNoBaseStep2 = impNoBase.stepDiffs.find((d) => d.step === 2);
+ok(!impNoBaseStep2 || !impNoBaseStep2.diffs.some((d) => d.phase === 'send'),
+  '默认起点下第 3 步两侧都发送（差异仅 expiresISO 属性），对照确实沿用了传入的起点');
+
 console.log(`全部 ${passed} 条断言通过，另含若干深度比较断言。`);

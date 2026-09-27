@@ -33,6 +33,13 @@
   <main class="wrap layout">
     <section class="panel editor">
       <h2>步骤编辑</h2>
+      <div class="har-bar">
+        <button id="btn-har" type="button" title="从本地 HAR 文件导入请求序列（解析在浏览器内完成，不上传）">📥 导入 HAR</button>
+        <input type="file" id="har-file" accept=".har,application/json" hidden>
+        <span class="har-bar-hint">本地解析，不上传；至多 100 条</span>
+      </div>
+      <div id="base-time-hint" class="hidden"></div>
+      <div id="har-panel" class="hidden"></div>
       <div id="steps"></div>
     </section>
 
@@ -55,6 +62,7 @@
   <script src="examples.js"></script>
   <script src="lifecycle.js"></script>
   <script src="serverview.js"></script>
+  <script src="har.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
