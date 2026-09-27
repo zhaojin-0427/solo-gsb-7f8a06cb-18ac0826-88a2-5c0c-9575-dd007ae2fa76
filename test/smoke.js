@@ -1012,4 +1012,185 @@ assert.strictEqual(direct.length, 0, '同一次结果自比无差异（含原因
 assert.strictEqual(impVal.modifiedStep.seconds, impactSteps[0].seconds, '秒数保持不变');
 assert.strictEqual(impVal.baselineStep.url, impactSteps[0].url, '基线对象保留原 URL');
 
+// ---------- 模拟起点（baseTime）：Expires 按绝对时间判定 ----------
+
+const { METHODS } = require('../lib/simulate');
+
+// 起点早于 Expires：写入并发送；时钟从起点累加
+const absOk = runSimulation([
+  { seconds: 0, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['s=1; Path=/; Expires=Wed, 01 Jul 2026 00:00:00 GMT'] },
+  { seconds: 10, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+], { baseTime: Date.parse('2026-06-01T00:00:00Z') }).results;
+assert.strictEqual(absOk[0].responses[0].status, 'stored', '起点早于 Expires：写入');
+assert.strictEqual(absOk[0].clockISO, '2026-06-01T00:00:00.000Z', '首步时钟 = 模拟起点');
+assert.strictEqual(absOk[1].clockISO, '2026-06-01T00:00:10.000Z', '时钟从模拟起点累加');
+ok(absOk[1].sent.some((c) => c.name === 's'), '未过期应发送');
+
+// 起点晚于 Expires：同一条 Set-Cookie 按删除处理
+const absGone = runSimulation([
+  { seconds: 0, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['s=1; Path=/; Expires=Wed, 01 Jul 2026 00:00:00 GMT'] }
+], { baseTime: Date.parse('2026-08-01T00:00:00Z') }).results;
+assert.strictEqual(absGone[0].responses[0].status, 'deleted', '起点晚于 Expires：按删除处理');
+
+// 缺省与非法 baseTime 回落到默认基准时钟
+const { BASE_TIME } = require('../lib/simulate');
+assert.strictEqual(runSimulation([{ seconds: 0, url: 'https://t.example/', setCookies: [] }]).results[0].clock,
+  BASE_TIME, '不传 options 用默认基准');
+assert.strictEqual(runSimulation([{ seconds: 0, url: 'https://t.example/', setCookies: [] }],
+  { baseTime: NaN }).results[0].clock, BASE_TIME, '非法 baseTime 回落默认基准');
+
+// 毫秒精度：相邻时间差精确到毫秒，Max-Age 判定按毫秒时钟
+const msRun = runSimulation([
+  { seconds: 0, url: 'https://t.example/', method: 'GET', setCookies: ['m=1; Path=/; Max-Age=1'] },
+  { seconds: 0.5, url: 'https://t.example/', method: 'GET', setCookies: [] },
+  { seconds: 0.6, url: 'https://t.example/', method: 'GET', setCookies: [] }
+], { baseTime: Date.parse('2026-06-01T00:00:00Z') }).results;
+assert.strictEqual(msRun[1].clockISO, '2026-06-01T00:00:00.500Z', '毫秒精度：0.5s');
+assert.strictEqual(msRun[2].clockISO, '2026-06-01T00:00:01.100Z', '毫秒精度：累加 0.6s');
+ok(msRun[1].sent.some((c) => c.name === 'm'), '0.5s 时 Max-Age=1 仍存活');
+ok(msRun[2].sent.length === 0 && msRun[2].unsent.some((u) => u.reasons.includes('EXPIRED')),
+  '1.1s 时 Max-Age=1 已过期');
+
+// ---------- 本地 HAR 导入（har.js）----------
+
+const HarImport = require('../public/har');
+
+// 解析：非 JSON / 缺 log.entries / 正常
+ok(HarImport.parseHarText('not json').ok === false, '非 JSON 判为无效文件');
+ok(HarImport.parseHarText('{"log":{}}').ok === false, '缺 log.entries 判为无效文件');
+ok(HarImport.parseHarText('{"log":{"entries":[]}}').ok === true, '空 entries 是有效 HAR');
+
+// startedDateTime：必须带时区且日期有效
+assert.strictEqual(HarImport.parseStartedDateTime('2026-09-01T10:00:00Z'),
+  Date.parse('2026-09-01T10:00:00Z'));
+assert.strictEqual(HarImport.parseStartedDateTime('2026-09-01T18:00:00+08:00'),
+  Date.parse('2026-09-01T10:00:00Z'), '+08:00 时区等价换算');
+assert.strictEqual(HarImport.parseStartedDateTime('2026-09-01T10:00:00'), null, '不带时区拒绝');
+assert.strictEqual(HarImport.parseStartedDateTime('2026-13-01T10:00:00Z'), null, '无效日期拒绝');
+assert.strictEqual(HarImport.parseStartedDateTime('2026-09-01 10:00:00Z'), null, '非 ISO 格式拒绝');
+assert.strictEqual(HarImport.parseStartedDateTime(123), null, '非字符串拒绝');
+
+// 逐条评估：方法 / startedDateTime / time / URL 四类校验
+const assessed = HarImport.assessEntries([
+  { startedDateTime: '2026-09-01T10:00:00Z', time: 0,
+    request: { method: 'GET', url: 'https://a.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:01Z', time: 0,
+    request: { method: 'CONNECT', url: 'https://b.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:02', time: 0,
+    request: { method: 'GET', url: 'https://c.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:03Z', time: -1,
+    request: { method: 'GET', url: 'https://d.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:04Z', time: 0,
+    request: { method: 'GET', url: 'ftp://e.example/f' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:05Z', time: Number.POSITIVE_INFINITY,
+    request: { method: 'GET', url: 'https://f.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:06Z', time: 12.5,
+    request: { method: 'post', url: 'https://g.example/' }, response: { headers: [] } }
+], METHODS);
+assert.strictEqual(assessed.length, 7);
+ok(assessed[0].importable, '正常记录可导入');
+ok(!assessed[1].importable && assessed[1].problems.some((p) => p.includes('方法')), '不支持的方法不可导入');
+ok(!assessed[2].importable && assessed[2].problems.some((p) => p.includes('startedDateTime')),
+  '不带时区的 startedDateTime 不可导入');
+ok(!assessed[3].importable && assessed[3].problems.some((p) => p.includes('time')), '负 time 不可导入');
+ok(!assessed[4].importable && assessed[4].problems.some((p) => p.includes('http')), '非 http(s) 不可导入');
+ok(!assessed[5].importable, '非有限 time 不可导入');
+ok(assessed[6].importable && assessed[6].method === 'POST', '方法大小写归一');
+assert.strictEqual(assessed[6].timeMs, 12.5, '非负有限小数 time 接受');
+
+// Set-Cookie 提取：头名不区分大小写、保持原顺序、不按逗号拆分
+const scEntry = {
+  response: { headers: [
+    { name: 'Content-Type', value: 'text/html' },
+    { name: 'Set-Cookie', value: 'sid=abc; Path=/; Expires=Tue, 01 Sep 2026 11:00:00 GMT' },
+    { name: 'set-cookie', value: 'cart=2; Path=/' },
+    { name: 'SET-COOKIE', value: 't=1; Secure' }
+  ] }
+};
+assert.deepStrictEqual(HarImport.setCookiesOf(scEntry), [
+  'sid=abc; Path=/; Expires=Tue, 01 Sep 2026 11:00:00 GMT',
+  'cart=2; Path=/',
+  't=1; Secure'
+], '全部 Set-Cookie 按原顺序取值，含逗号的 Expires 不拆分');
+assert.deepStrictEqual(HarImport.setCookiesOf({}), [], '缺 response.headers 时为空');
+assert.deepStrictEqual(HarImport.setCookiesOf({ response: { headers: [{ name: 'X-A', value: '1' }] } }), []);
+
+// 导入计划：按开始时间排序（同刻保留原行序），毫秒精度秒数，首条为 0，起点 = 首条记录时间
+const planRows = HarImport.assessEntries([
+  { startedDateTime: '2026-09-01T10:00:02Z', time: 50,
+    request: { method: 'GET', url: 'https://b.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:01.500Z', time: 0,
+    request: { method: 'GET', url: 'https://a.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:01.500Z', time: 0,
+    request: { method: 'POST', url: 'https://c.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T18:00:05.250+08:00', time: 250,
+    request: { method: 'GET', url: 'https://d.example/' }, response: { headers: [] } }
+], METHODS);
+const plan = HarImport.buildPlan(planRows);
+assert.deepStrictEqual(plan.items.map((it) => it.row.index), [1, 2, 0, 3],
+  '按开始时间排序，同刻保留原行序');
+assert.deepStrictEqual(plan.items.map((it) => it.seconds), [0, 0, 0.5, 3.25],
+  '相邻时间差生成秒数（毫秒精度），首步为 0');
+assert.strictEqual(plan.baseTime, Date.parse('2026-09-01T10:00:01.500Z'), '起点 = 首条记录时间');
+assert.strictEqual(plan.overlaps.length, 0, '无重叠');
+
+// 时间重叠：前一响应结束晚于下一请求开始 → 标出两行
+const overlapPlan = HarImport.buildPlan(HarImport.assessEntries([
+  { startedDateTime: '2026-09-01T10:00:00Z', time: 2000,
+    request: { method: 'GET', url: 'https://a.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:01Z', time: 10,
+    request: { method: 'GET', url: 'https://b.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:02Z', time: 10,
+    request: { method: 'GET', url: 'https://c.example/' }, response: { headers: [] } }
+], METHODS));
+assert.strictEqual(overlapPlan.overlaps.length, 1, '检出一处重叠');
+assert.strictEqual(overlapPlan.overlaps[0].a.index, 0);
+assert.strictEqual(overlapPlan.overlaps[0].b.index, 1);
+
+// 边界：前一响应结束恰好等于下一请求开始，不算重叠
+const boundaryPlan = HarImport.buildPlan(HarImport.assessEntries([
+  { startedDateTime: '2026-09-01T10:00:00Z', time: 1000,
+    request: { method: 'GET', url: 'https://a.example/' }, response: { headers: [] } },
+  { startedDateTime: '2026-09-01T10:00:01Z', time: 0,
+    request: { method: 'GET', url: 'https://b.example/' }, response: { headers: [] } }
+], METHODS));
+assert.strictEqual(boundaryPlan.overlaps.length, 0, '结束等于下一开始不算重叠');
+
+// ---------- 最小复现 / 策略求解 / 影响对照沿用模拟起点 ----------
+
+const bt = Date.parse('2026-07-01T00:00:00Z');
+const stepsBt = [
+  { seconds: 0, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['tmp=1; Path=/; Expires=Wed, 01 Jul 2026 00:00:10 GMT', 'noise=1; Path=/'] },
+  { seconds: 5, url: 'https://t.example/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+];
+const simBt = runSimulation(stepsBt, { baseTime: bt }).results;
+const tmpBt = simBt[1].sent.find((c) => c.name === 'tmp');
+ok(tmpBt, '该起点下 tmp 未过期应发送');
+const minBt = minimizeSteps(stepsBt,
+  { stepIndex: 1, name: 'tmp', value: '1', domain: tmpBt.domain, path: '/', sent: true },
+  { baseTime: bt });
+ok(minBt.ok === true, '带模拟起点的最小复现应成功');
+assert.strictEqual(minBt.keptClock, minBt.targetClock, '最小复现保持绝对时刻');
+assert.strictEqual(minBt.keptClock, bt + 5000, '绝对时刻沿用同一模拟起点');
+assert.deepStrictEqual(minBt.steps[0].setCookies, ['tmp=1; Path=/; Expires=Wed, 01 Jul 2026 00:00:10 GMT'],
+  '无关 Set-Cookie 行被去掉');
+
+const solBt = solveStrategy([
+  { seconds: 0, url: 'https://shop.example.com/', method: 'GET', topUrl: '', isNavigation: false,
+    setCookies: ['sid=abc; Path=/; Expires=Wed, 01 Jul 2026 00:01:00 GMT'] },
+  { seconds: 1, url: 'https://shop.example.com/', method: 'GET', topUrl: '', isNavigation: false, setCookies: [] }
+], { stepIndex: 0, respIndex: 0, raw: 'sid=abc; Path=/; Expires=Wed, 01 Jul 2026 00:01:00 GMT',
+  marks: [{ stepIndex: 1, sent: true }] }, { baseTime: bt });
+ok(solBt.ok === true, '带模拟起点的策略求解应成功');
+ok(solBt.setCookie.includes('Expires=Wed, 01 Jul 2026 00:01:00 GMT'), '有效期属性按原文保留');
+
+const impBtSame = compareSteps(stepsBt, { stepIndex: 1, url: 'https://t.example/' }, { baseTime: bt });
+ok(impBtSame.ok && impBtSame.identical, '带模拟起点的对照：无变更即无差异');
+const impBtDiff = compareSteps(stepsBt, { stepIndex: 1, topUrl: 'https://other.example/' }, { baseTime: bt });
+ok(impBtDiff.ok && !impBtDiff.identical && impBtDiff.firstDiff.phase === 'send',
+  '带模拟起点的对照：跨站变更在发送阶段出现差异');
+
 console.log(`全部 ${passed} 条断言通过，另含若干深度比较断言。`);

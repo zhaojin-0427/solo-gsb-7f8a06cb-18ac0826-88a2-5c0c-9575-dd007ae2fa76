@@ -18,7 +18,21 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true });
 });
 
-// 模拟执行：{ steps: [...] }
+/**
+ * 解析可选的模拟起点（epoch 毫秒，HAR 导入时为首条记录时间）。
+ * 缺省 / null 表示用引擎默认基准时钟；非法值返回 error。
+ */
+function parseBaseTime(body) {
+  const v = body && body.baseTime;
+  if (v === undefined || v === null) return { options: {} };
+  const n = Number(v);
+  if (!Number.isFinite(n) || Math.abs(n) > 8.64e15) {
+    return { error: 'baseTime 必须是有效的毫秒时间戳' };
+  }
+  return { options: { baseTime: n } };
+}
+
+// 模拟执行：{ steps: [...], baseTime? }
 app.post('/api/simulate', (req, res) => {
   const steps = Array.isArray(req.body && req.body.steps) ? req.body.steps : null;
   if (!steps) {
@@ -27,6 +41,8 @@ app.post('/api/simulate', (req, res) => {
   if (steps.length > 100) {
     return res.status(400).json({ error: '一次最多 100 个步骤' });
   }
+  const bt = parseBaseTime(req.body);
+  if (bt.error) return res.status(400).json({ error: bt.error });
   try {
     const normalized = steps.map((s) => ({
       seconds: s && s.seconds,
@@ -36,13 +52,13 @@ app.post('/api/simulate', (req, res) => {
       isNavigation: s && s.isNavigation,
       setCookies: Array.isArray(s && s.setCookies) ? s.setCookies : []
     }));
-    res.json(runSimulation(normalized));
+    res.json(runSimulation(normalized, bt.options));
   } catch (err) {
     res.status(500).json({ error: '模拟执行失败：' + err.message });
   }
 });
 
-// 最小复现：{ steps: [...], target: { stepIndex, name, value, domain, path, sent, reasons? } }
+// 最小复现：{ steps: [...], target: { stepIndex, name, value, domain, path, sent, reasons? }, baseTime? }
 app.post('/api/minimize', (req, res) => {
   const steps = Array.isArray(req.body && req.body.steps) ? req.body.steps : null;
   const target = req.body && req.body.target;
@@ -55,8 +71,10 @@ app.post('/api/minimize', (req, res) => {
   if (!target || typeof target !== 'object') {
     return res.status(400).json({ error: '请求体需要包含 target 对象' });
   }
+  const bt = parseBaseTime(req.body);
+  if (bt.error) return res.status(400).json({ error: bt.error });
   try {
-    const out = minimizeSteps(steps, target);
+    const out = minimizeSteps(steps, target, bt.options);
     if (!out.ok) {
       // 无法定位目标：提示调用方，不改动任何编辑内容
       return res.status(404).json({ error: out.error });
@@ -67,7 +85,7 @@ app.post('/api/minimize', (req, res) => {
   }
 });
 
-// 策略求解：{ steps: [...], target: { stepIndex, respIndex, raw?, marks: [{stepIndex, sent}] } }
+// 策略求解：{ steps: [...], target: { stepIndex, respIndex, raw?, marks: [{stepIndex, sent}] }, baseTime? }
 app.post('/api/solve', (req, res) => {
   const steps = Array.isArray(req.body && req.body.steps) ? req.body.steps : null;
   const target = req.body && req.body.target;
@@ -80,8 +98,10 @@ app.post('/api/solve', (req, res) => {
   if (!target || typeof target !== 'object') {
     return res.status(400).json({ error: '请求体需要包含 target 对象' });
   }
+  const bt = parseBaseTime(req.body);
+  if (bt.error) return res.status(400).json({ error: bt.error });
   try {
-    const out = solveStrategy(steps, target);
+    const out = solveStrategy(steps, target, bt.options);
     if (!out.ok && out.invalid) {
       // 目标 / 标记无效（含步骤已被修改）：提示调用方，不改动任何编辑内容
       return res.status(404).json({ error: out.error });
@@ -92,7 +112,7 @@ app.post('/api/solve', (req, res) => {
   }
 });
 
-// 步骤变更影响：{ steps: [...], change: { stepIndex, url?, method?, topUrl?, isNavigation?, setCookies? } }
+// 步骤变更影响：{ steps: [...], change: { stepIndex, url?, method?, topUrl?, isNavigation?, setCookies? }, baseTime? }
 app.post('/api/impact', (req, res) => {
   const steps = Array.isArray(req.body && req.body.steps) ? req.body.steps : null;
   const change = req.body && req.body.change;
@@ -105,8 +125,10 @@ app.post('/api/impact', (req, res) => {
   if (!change || typeof change !== 'object') {
     return res.status(400).json({ error: '请求体需要包含 change 对象' });
   }
+  const bt = parseBaseTime(req.body);
+  if (bt.error) return res.status(400).json({ error: bt.error });
   try {
-    const out = compareSteps(steps, change);
+    const out = compareSteps(steps, change, bt.options);
     if (!out.ok && out.invalid) {
       // 变更参数无效（含步下标越界）：提示调用方，不改动任何编辑内容
       return res.status(404).json({ error: out.error });

@@ -33,6 +33,12 @@
   <main class="wrap layout">
     <section class="panel editor">
       <h2>步骤编辑</h2>
+      <div class="editor-tools">
+        <button id="btn-har" type="button">📥 导入 HAR</button>
+        <input type="file" id="har-file" accept=".har,.json,application/json" class="hidden" />
+        <span class="base-time" id="base-time"></span>
+      </div>
+      <div id="har-panel" class="hidden"></div>
       <div id="steps"></div>
     </section>
 
@@ -55,6 +61,7 @@
   <script src="examples.js"></script>
   <script src="lifecycle.js"></script>
   <script src="serverview.js"></script>
+  <script src="har.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
